@@ -275,7 +275,6 @@ All six project phases are complete:
 ## 📜 License
 
 Released under the **[MIT License](LICENSE)**.
-## License & Copyright
 
 Copyright © 2026 Mohamed Wael. All Rights Reserved.
 
