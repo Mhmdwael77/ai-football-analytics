@@ -275,6 +275,15 @@ All six project phases are complete:
 ## 📜 License
 
 Released under the **[MIT License](LICENSE)**.
+## License & Copyright
+
+Copyright © 2026 Mohamed Wael. All Rights Reserved.
+
+This project is proprietary software. No permission is granted to copy,
+modify, distribute, publish, sell, sublicense, deploy, or use this software
+without prior written authorization from the copyright owner.
+
+See the [LICENSE](LICENSE) file for full terms.
 
 ---
 
