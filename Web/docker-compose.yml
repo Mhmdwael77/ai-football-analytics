@@ -1,0 +1,95 @@
+
+services:
+  # Caching and job queue broker (simulates Upstash locally)
+  redis:
+    image: redis:7-alpine
+    container_name: trakora-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # OpenTelemetry Collector (receives traces/metrics from backend, routes to Jaeger/Prometheus/Loki)
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.95.0
+    container_name: trakora-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "8889:8889" # Prometheus metrics exporter from collector
+    depends_on:
+      - jaeger
+      - prometheus
+      - loki
+
+  # Distributed Tracing Backend and UI
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: trakora-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686" # Jaeger Web UI
+      - "14250:14250" # Model ingestion gRPC
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  # Metrics Storage and Query Engine
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: trakora-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+
+  # Centralized Log Aggregation
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: trakora-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./config/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+
+  # Unified Observability Dashboard
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: trakora-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./config/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
