@@ -11,11 +11,14 @@ compensation (GMC) and Kalman model give more stable IDs under camera
 motion, occlusion and visually similar players.
 
 Notes on ReID:
-    Native ReID (``with_reid: true`` + ``reid_model: auto``) extracts
-    appearance features from the detector via a forward hook that only
-    exists on the ``model.track()`` path, so it cannot run here. Set
-    ``reid_model`` to a real ReID checkpoint to enable appearance ReID;
-    otherwise GMC + motion + IoU is used.
+    ``reid_model: "auto"`` is the one value that cannot work here -- it means
+    "reuse the detector's backbone features", which are only exposed by a
+    forward hook on the ``model.track()`` path. Every other value is a real
+    encoder: Ultralytics builds it with ``build_encoder`` and it crops from
+    the ``frame`` we already hand to ``update()``, so no detector hook is
+    involved. Point ``reid_model`` at any YOLO checkpoint (e.g.
+    ``weights/yolo11n-cls.pt``) to get appearance ReID;
+    with ``with_reid: false`` the tracker falls back to GMC + motion + IoU.
 """
 
 from __future__ import annotations

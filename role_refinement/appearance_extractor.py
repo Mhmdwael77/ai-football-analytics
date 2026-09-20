@@ -51,7 +51,18 @@ _VAL_WEIGHT = 1.0
 # Grass mask (OpenCV HSV ranges: H in 0..180, S/V in 0..255). Anything
 # green-ish and reasonably saturated/bright is treated as pitch and
 # dropped before histogramming.
-_GRASS_HUE_LOW = 35
+# Grass sits around hue 45..75. Starting the band at 35 also deleted the low
+# end of a yellow-green referee shirt, so an official was measured mostly from
+# whatever showed through and came out a brown that sat close to a kit.
+# Measured on Tesr1, as a fraction of the distance between the two kits:
+#   hue >= 35  officials 0.24 from the nearer kit, kits 194 apart
+#   hue >= 40  officials 0.57 from the nearer kit, kits 188 apart
+#   hue >= 45  officials 0.64 from the nearer kit, kits 148 apart
+# 40 more than doubles the margin that keeps officials out of a squad and
+# costs almost nothing between the kits; 45 buys a little more and starts
+# collapsing the two kits into each other, which is the thing that must not
+# blur.
+_GRASS_HUE_LOW = 40
 _GRASS_HUE_HIGH = 85
 _GRASS_SAT_MIN = 40
 _GRASS_VAL_MIN = 40
@@ -198,6 +209,33 @@ class AppearanceExtractor:
         if hist is None:
             return None
         return hist
+
+    def median_bgr(self, crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Median jersey colour in raw BGR, grass removed, or ``None``.
+
+        The histogram feature above is built for asking whether two shirts are
+        the same, and it is normalised and hue-weighted to make that robust.
+        That normalisation is exactly wrong for the other question -- how many
+        *kinds* of shirt are on this pitch -- because it flattens the very
+        difference that separates them. Measured on Tesr1, clustering the
+        histograms put the referee in a team and gave him a squad number;
+        clustering these medians left him out, because his yellow sits 160
+        apart from either kit in blue-versus-green while the two kits sit 40
+        apart from each other in the same terms.
+
+        So: use the histogram to compare shirts, and this to count them.
+        """
+        if crop is None or crop.size == 0 or crop.ndim != 3:
+            return None
+        jersey = self._jersey_region(crop)
+        if jersey.size == 0:
+            return None
+        hsv = cv2.cvtColor(jersey, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        flat = jersey.reshape(-1, 3)
+        mask = self._foreground_mask(hsv[:, 0], hsv[:, 1], hsv[:, 2])
+        if mask.sum() < _MIN_FOREGROUND_PIXELS:
+            return None            # nothing but grass: no opinion, not a guess
+        return np.median(flat[mask].astype(np.float32), axis=0)
 
     def dominant_hsv(self, crop: Optional[np.ndarray]) -> Optional[Tuple[int, int, int]]:
         """Approximate dominant jersey HSV color (for reasons/debugging)."""

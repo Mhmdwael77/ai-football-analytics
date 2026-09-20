@@ -114,12 +114,22 @@ class DetectionPipeline:
             try:
                 for frame_index, frame in reader.frames():
                     fps_meter.start()
-                    detections = self._detector.detect(frame)
-                    tracks = (
-                        tracker.update(detections, frame, frame_index)
-                        if tracker
-                        else None
-                    )
+                    if tracker and self._config.tracking.feed_weak_detections:
+                        # One inference, two lists: the confident boxes are what
+                        # we export and draw; the weak ones exist only so the
+                        # tracker's low-score association pass can hold an id
+                        # through a dropout instead of minting a new one.
+                        detections, weak = self._detector.detect_with_weak(frame)
+                        tracks = tracker.update(
+                            detections + weak, frame, frame_index
+                        )
+                    else:
+                        detections = self._detector.detect(frame)
+                        tracks = (
+                            tracker.update(detections, frame, frame_index)
+                            if tracker
+                            else None
+                        )
                     fps_meter.stop()
 
                     # Raw detections are always exported (preserved for debug).

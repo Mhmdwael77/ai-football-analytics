@@ -7,3 +7,7 @@ pytest>=8.0.0
 # (`streamlit run manual_correction/correction_ui.py`). The core
 # pipeline and all tests run without it.
 streamlit>=1.30.0
+
+# Optional: only needed for `python -m evaluation.mota_eval` (MOTA / IDF1 /
+# ID-switch counts against a ground-truth file). The pipeline runs without it.
+motmetrics>=1.4.0

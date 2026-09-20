@@ -60,19 +60,48 @@ tracking:
   tracker_type: "botsort"           # "botsort" (preferred) | "bytetrack"
   separate_ball: true               # track the ball with its own tracker
   ball_class_name: "ball"
-  # Native ReID needs Ultralytics' model.track() path (detector features),
-  # which is unavailable when feeding our own detections. Left off here;
-  # GMC + Kalman + IoU still give strong ID stability under occlusion.
-  # Set true AND point reid_model at a checkpoint to enable appearance ReID.
+  # Appearance ReID. `reid_model: "auto"` is the ONLY unsupported value here
+  # (it means "reuse the detector's backbone features", which exist only on
+  # Ultralytics' model.track() path). Any real checkpoint works: Ultralytics'
+  # ReID encoder crops from the frame we already pass to update(), so no
+  # detector hook is involved -- verified to yield 256-d embeddings here.
+  # This is what separates two TEAMMATES in identical kits; motion + IoU
+  # alone cannot, and that is where most ID switches come from.
+  # OFF deliberately. yolo11n-cls.pt is an ImageNet *classifier*, not a person
+  # re-identification encoder: its embeddings say what kind of object is in the
+  # crop, not which player, so for teammates in identical kits it is close to
+  # noise. Measured on clasico_clip it made identity worse (53 -> 111 ids,
+  # 12 -> 47 switches) and cost roughly 5x in speed. Turn this back on only
+  # with a real ReID checkpoint (OSNet or similar), and re-measure.
   with_reid: false
-  reid_model: "auto"
+  reid_model: "weights/yolo11n-cls.pt"   # unused while with_reid is false
+
+  # Hand the tracker the boxes that FAILED the per-class display thresholds.
+  # BoT-SORT associates in two passes and the second is over low-score boxes:
+  # that pass is what carries an id through a partial occlusion. Filtering at
+  # `player: 0.50` before the tracker left it with nothing to match, so a
+  # player whose score dipped for a few frames lost their track and returned
+  # as a NEW id. Measured here, dropouts -- not association errors -- caused
+  # essentially every id switch. Weak boxes are never exported or drawn, and
+  # `new_track_thresh` stops them spawning tracks of their own.
+  feed_weak_detections: true
   save_tracks: true
 
   # Main tracker: player / goalkeeper / referee.
   main:
-    track_high_thresh: 0.25
-    track_low_thresh: 0.10
-    new_track_thresh: 0.25
+    track_high_thresh: 0.50         # 1st association pass: confident boxes
+    track_low_thresh: 0.10          # 2nd pass: weak boxes, to hold ids through dips
+    # A NEW id is only minted above this. At the old 0.25 the weak boxes were
+    # spawning tracks of their own instead of continuing existing ones, which is
+    # what fragmented identities -- essentially every id switch on these clips
+    # was a dropout followed by a new id, not the tracker confusing two players.
+    # Measured over 400 frames on three clips, 0.25 -> 0.60:
+    #   clasico_clip   53 -> 39 ids,  12 -> 3 switches,  coverage -1.2 pp
+    #   match3         68 -> 42 ids,  28 -> 8 switches,  coverage -1.9 pp
+    #   input_video2   33 -> 26 ids,   4 -> 1 switches,  coverage -0.7 pp
+    # 0.65 buys a few more on match3 but costs another ~1 pp of coverage and
+    # ties on the other two, so 0.60 is the better general default.
+    new_track_thresh: 0.60
     track_buffer: 30                # frames a lost track survives
     match_thresh: 0.80
     fuse_score: true
@@ -110,10 +139,29 @@ tracking:
   # Pure post-process; the BoT-SORT tracker itself is untouched.
   # Enable with `enabled: true` or the --stitch-tracks CLI flag.
   stitching:
-    enabled: false
-    max_frame_gap: 45               # frames a track may vanish before re-link
-    distance_gate_px: 120.0         # max gap between predicted & new position
-    size_ratio_gate: 1.6            # bbox size compatibility (max ratio)
+    # On by default: it re-links ids across gaps longer than the tracker can
+    # bridge, which is the largest remaining bucket of switches (track_buffer
+    # provably cannot reach them -- after a long gap the Kalman box has drifted
+    # and IoU is ~0).
+    #
+    # The gates are wider than they look because they have a specific job:
+    # `new_track_thresh` (0.60) deliberately refuses to start a track from a
+    # low-confidence box, which protects against spurious ids -- but a distant,
+    # partly-occluded player detected at 0.52 then goes UNTRACKED until his
+    # confidence recovers. Traced on Tesr1: a player was detected continuously
+    # at 0.50-0.56 for 13 frames while the tracker held no id for him, then
+    # reappeared as a new id. Stitching is what repairs those holes.
+    #
+    # Measured on Tesr1 (ids born mid-pitch, i.e. the tracker losing somebody
+    # rather than a player walking into shot):
+    #   no stitching   31      gap 45/120   13      gap 75/180    9
+    #   gap 120/250     5  but it also welds two different players together
+    #   (a track that covered 241 px in 9 frames -- 2.4x a human sprint).
+    # 75/180 is the widest setting that gained ground without inventing a link.
+    enabled: true
+    max_frame_gap: 75               # frames a track may vanish before re-link
+    distance_gate_px: 180.0         # max gap between predicted & new position
+    size_ratio_gate: 1.8            # bbox size compatibility (max ratio)
     match_same_class: true          # only stitch tracks of the same class
     min_segment_length: 8           # drop noise tracks shorter than this (ball kept)
 
@@ -128,6 +176,54 @@ tracking:
     frame_tol: 25                   # max frame gap between the paired flips
     distance_gate_px: 220.0         # how close the two tracks must cross
     min_purity: 0.8                 # how clean the before/after split must be
+    # Where the exchange is made. Appearance says THAT two tracks were
+    # swapped but not WHEN: a jersey only reads as the other team once the
+    # players have drawn apart again, tens of frames after the boxes were
+    # handed over. Cutting there made each repaired track teleport across
+    # that gap -- measured on Tesr1, the worst step went from 13 px/frame to
+    # 376, i.e. players flung across the pitch. The window is instead nudged
+    # to the cheapest join nearby, which is the crossing itself; that put the
+    # worst step back to 37. Edges that sit at the very start or end of both
+    # tracks are left alone -- there is no crossing there to align to.
+    edge_refine_frames: 45
+
+  # Fixed squad numbers. Instead of letting the tracker mint ids until it runs
+  # out of confidence -- 27 of them for 22 people on Tesr1 -- the ids exist
+  # first: 1..11 for one team, 12..22 for the other, 0 for the ball. Every
+  # track is placed in one of them or in none, so an id means a person for the
+  # whole clip and running out is visible rather than silent.
+  #
+  # Measured on Tesr1 before choosing these numbers:
+  #   * players on screen at once: min 19, median 22, max 24 -- so 11 a side
+  #     is right, and the occasional 23rd/24th box is a false positive that
+  #     SHOULD be refused a number rather than given one.
+  #   * two goalkeepers were never both visible, in any of 1471 frames; the
+  #     broadcast frame does not reach both goals. So the keeper is one of the
+  #     eleven, not a separate slot.
+  #   * the longest a real track vanished for was 49 frames (2.0 s), and 99%
+  #     of gaps were under that. A 30 s rule would never fire; 75 frames (3 s)
+  #     is twice the worst gap seen and still short enough that a number is
+  #     freed while the clip is running.
+  #
+  # What this CANNOT do: colour separates the two kits, not the eleven players
+  # inside one. Two team-mates can still exchange numbers and nothing here
+  # will notice -- at this camera distance a shirt number is about 8 px tall.
+  roster:
+    enabled: true
+    slots_per_team: 11
+    max_gap_frames: 75              # a number is freed after this long unworn
+    distance_gate_px: 250.0         # how far a returning player may reappear
+    unnumbered_classes: ["referee"] # not part of either squad
+    pitch_sample_every: 5           # project every Nth frame to metres
+    # A goalkeeper is found two ways, because one is not enough. The absolute
+    # test -- standing in front of a goal -- missed Barcelona's keeper on
+    # Tesr1 twice over: he played a high line at 27-31 m, and the camera never
+    # showed anything closer than 27 m to that goal, so the 22 m box the test
+    # checks was never on screen. The relative test has neither weakness: he
+    # is behind his own outfield whatever the camera does. It needs the
+    # lateral gate beside it, because an assistant referee beyond the last
+    # defender scores 100% on it too (measured), and so does the odd full-back
+    # -- a keeper sits on the midline and neither of them does.
 
 # =====================================================================
 # Phase 3 — Track-level Role Refinement

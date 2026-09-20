@@ -17,7 +17,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from detection.pipeline import DetectionPipeline
@@ -536,6 +538,28 @@ def main(argv=None) -> int:
             print(f"  drift splits     : {swap_stats.get('splits', 0)}")
             if swap_stats["pairs"]:
                 print(f"  pairs            : {swap_stats['pairs']}")
+
+    # Fixed squad numbers over the corrected tracks, before role refinement so
+    # that everything downstream is keyed by a squad number rather than by
+    # whatever id the tracker happened to mint.
+    if config.tracking.roster.enabled and summary.get("tracks_json"):
+        try:
+            roster_stats = run_roster(config, video_path, summary)
+        except Exception:
+            logger.exception("Roster numbering failed (continuing with raw ids)")
+            roster_stats = None
+        if roster_stats is not None:
+            used = roster_stats["slots_used"]
+            print("\n=== Squad numbers ===")
+            print(f"  numbered         : {roster_stats['numbered']}")
+            print(f"  per team         : "
+                  f"{used.get(0, 0)}/{config.tracking.roster.slots_per_team}, "
+                  f"{used.get(1, 0)}/{config.tracking.roster.slots_per_team}")
+            print(f"  left unnumbered  : {roster_stats['overflow']}")
+            print(f"  roles from       : "
+                  f"{'pitch position' if roster_stats['by_position'] else 'colour only'}")
+            print(f"  seen             : {roster_stats['roles']}")
+            print(f"  roster JSON      : {summary['tracks_json']}")
 
     # Manual ID-switch swaps the reviewer marked (track surgery before roles).
     # Runs in reuse mode too -- it re-derives from the stable auto-corrected
@@ -1490,6 +1514,201 @@ def run_swap_correction(config, video_path, summary):
         "splits": len(result.splits),
         "pairs": [f"#{a}<->#{b}@{s}-{e}" for a, b, s, e in result.swaps],
     }
+
+
+def run_roster(config, video_path, summary):
+    """Replace free-running track ids with a fixed squad: 1..11, 12..22, 0.
+
+    Runs after every id-repairing step and before role refinement, so the rest
+    of the pipeline sees squad numbers rather than whatever the tracker
+    happened to mint. That ordering is the point: with a bounded set of ids, a
+    missing player shows up as an empty shirt instead of hiding among a surplus
+    of ids nobody counted.
+
+    Who is in a squad is decided twice over, because neither signal is enough
+    alone. Colour puts the two kits into two clusters and everything else into
+    a third -- but a goalkeeper is *required* to wear something the outfield
+    players do not, so he lands in that third group beside the officials, and a
+    colour-only rule would strike him off. Geometry then separates the third
+    group by what its members do on the ground: an assistant hugs a touchline,
+    a keeper holds the area in front of one goal, the referee roams the middle.
+    The keeper goes back into his squad and the officials stay out.
+
+    Geometry needs a calibration. Without one this falls back to colour alone
+    and says so, because a roster that occasionally benches a goalkeeper is
+    still better than 27 ids for 22 people -- but it is worth knowing which of
+    the two ran.
+    """
+    logger = get_logger("main.roster")
+    tracks_json = summary.get("tracks_json")
+    if not tracks_json:
+        return None
+
+    import cv2
+    import numpy as np
+
+    from analytics.pitch_role import (
+        belongs_in_a_squad,
+        best_deepest_share,
+        classify,
+    )
+    from role_refinement.appearance_extractor import (
+        AppearanceExtractor,
+        build_track_history,
+    )
+    from role_refinement.role_refiner import (
+        VideoCropProvider,
+        _invert_plan,
+        load_frame_tracks,
+    )
+    from tracking.roster import apply
+    from tracking.track_exporter import TrackJSONExporter
+    from utils.config_loader import RoleRefinementConfig
+
+    cfg = config.tracking.roster
+    frames, _frame_size, meta = load_frame_tracks(tracks_json)
+    if not frames:
+        return None
+
+    rr = RoleRefinementConfig(ball_class_name=config.tracking.ball_class_name)
+    extractor = AppearanceExtractor(rr)
+    history = build_track_history(frames)
+    plan = extractor.sample_frames(history)
+    provider = VideoCropProvider.from_video(
+        video_path, _invert_plan(history, plan, rr))
+
+    shirts, sampled = {}, {}
+    for track_id, observations in history.items():
+        if observations and observations[0].class_name == rr.ball_class_name:
+            continue
+        boxes = {o.frame_id: o.bbox for o in observations}
+        colours, frames_used = [], []
+        for frame_id in plan.get(track_id, []):
+            colour = extractor.median_bgr(
+                provider.get(track_id, frame_id, boxes.get(frame_id)))
+            if colour is not None:
+                colours.append(colour)
+                frames_used.append(frame_id)
+        if colours:
+            shirts[track_id] = np.median(np.stack(colours, axis=0), axis=0)
+            sampled[track_id] = frames_used
+
+    if len(shirts) < 3:
+        logger.info("Roster: too few tracks to tell the kits apart; skipping")
+        return None
+
+    # Three shirt groups, not two: the officials and the keepers wear neither
+    # kit, and forcing them into the nearer one is what puts a referee in a
+    # team. The two most populous groups are the teams.
+    #
+    # Raw medians rather than the appearance histogram. The histogram is
+    # normalised for comparing two shirts and that normalisation blurs how
+    # FAR apart three kinds of shirt are: clustered on histograms the referee
+    # joined a team and wore squad number 22, while on medians his yellow is
+    # 160 apart from either kit and lands in its own group.
+    ids = sorted(shirts)
+    data = np.float32([shirts[i] for i in ids])
+    _compact, labels, _centres = cv2.kmeans(
+        data, 3, None,
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.1),
+        16, cv2.KMEANS_PP_CENTERS)
+    labels = labels.ravel().tolist()
+    counts = Counter(labels)
+    kits = [group for group, _ in counts.most_common(2)]
+
+    homography = _build_homography(config, video_path, logger, tracks_json)
+    boxes_at = {tid: {o.frame_id: o.bbox for o in obs}
+                for tid, obs in history.items()}
+
+    # Pitch positions on a regular frame grid rather than at each track's own
+    # sample frames: telling who is deepest means comparing tracks against each
+    # other, and the per-track sampling plan gives them almost no frames in
+    # common to be compared on.
+    picker = getattr(homography, "for_frame", None) if homography else None
+    walked = defaultdict(dict)                 # track -> {frame: (x, y) metres}
+    if homography is not None:
+        for track_id, observations in history.items():
+            for o in observations:
+                if o.frame_id % cfg.pitch_sample_every:
+                    continue
+                H = picker(o.frame_id) if picker else homography
+                x, y = H.project_image_to_field(
+                    ((o.bbox[0] + o.bbox[2]) / 2.0, o.bbox[3]))
+                if math.isfinite(x) and math.isfinite(y):
+                    walked[track_id][o.frame_id] = (float(x), float(y))
+
+    # Where each team stood, frame by frame, so "behind all of them" can be
+    # asked of anyone the kits left out.
+    team_positions = [defaultdict(list), defaultdict(list)]
+    for index, track_id in enumerate(ids):
+        if labels[index] not in kits:
+            continue
+        side = kits.index(labels[index])
+        for frame, point in walked.get(track_id, {}).items():
+            team_positions[side][frame].append(point)
+
+    team_of, roles = {}, Counter()
+    for index, track_id in enumerate(ids):
+        wears_kit = labels[index] in kits
+        track = walked.get(track_id, {})
+        # Only worth computing for someone outside both kits: a keeper in a
+        # team shirt is an outfield player as far as numbering is concerned.
+        behind = 0.0 if wears_kit else best_deepest_share(track, team_positions)
+        role = classify(list(track.values()), wears_kit, behind_team=behind)
+        roles[role.value] += 1
+        if belongs_in_a_squad(role):
+            side = kits.index(labels[index]) if wears_kit else _nearest_team(
+                shirts[track_id], data, labels, kits)
+            team_of[track_id] = side
+
+    result = apply(
+        frames, team_of,
+        slots_per_team=cfg.slots_per_team,
+        max_gap_frames=cfg.max_gap_frames,
+        distance_gate_px=cfg.distance_gate_px,
+        ball_class_name=config.tracking.ball_class_name,
+        unnumbered_classes=tuple(cfg.unnumbered_classes),
+    )
+
+    stem = Path(video_path).stem
+    out_path = Path(config.video.output_dir) / f"{stem}_tracks_roster.json"
+    roster_meta = dict(meta)
+    roster_meta.update({"roster": True, "slots_used": result.slots_used,
+                        "overflow": len(result.overflow),
+                        "pitch_roles": bool(homography)})
+    exporter = TrackJSONExporter(out_path, metadata=roster_meta)
+    for frame in result.frames:
+        exporter.add_frame(frame.frame_index, frame.tracks)
+    exporter.save()
+
+    summary["tracks_json"] = str(out_path)
+    logger.info("Roster written to %s", out_path)
+    return {
+        "numbered": len(result.assignment),
+        "slots_used": result.slots_used,
+        "overflow": len(result.overflow),
+        "roles": dict(roles),
+        "by_position": homography is not None,
+    }
+
+
+def _nearest_team(vector, data, labels, kits):
+    """Which kit a non-kit shirt sits closest to -- used only for a keeper.
+
+    A goalkeeper has already been identified by where he plays; this only has
+    to decide which half of the squad numbers he takes, and the nearer kit is
+    the best available guess. It can be wrong, and when it is, the keeper wears
+    the other side's number -- visible, and fixable by hand.
+    """
+    import numpy as np
+
+    best, side = None, 0
+    for group in kits:
+        members = np.stack([data[i] for i, g in enumerate(labels) if g == group])
+        distance = float(np.linalg.norm(vector - members.mean(axis=0)))
+        if best is None or distance < best:
+            best, side = distance, kits.index(group)
+    return side
 
 
 def run_manual_swap(config, video_path, summary):

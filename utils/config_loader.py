@@ -135,6 +135,37 @@ class SwapCorrectionConfig:
     split_unpaired: bool = False
     min_split_samples: int = 3        # off-team samples needed to split
     min_split_purity: float = 0.7     # only split a track with a clear home team
+    # Where to make the exchange. Appearance says THAT two tracks swapped but
+    # not WHEN -- the jersey only reads as the other team once the players
+    # have drawn apart, tens of frames later. Cutting there makes each
+    # repaired track teleport across that gap; the window is instead nudged to
+    # the cheapest join nearby, which is the crossing itself.
+    edge_refine_frames: int = 45
+
+
+@dataclass
+class RosterConfig:
+    """Fixed squad numbers: 1..11 one team, 12..22 the other, 0 the ball.
+
+    Bounds the ids instead of letting the tracker mint them, so a number means
+    a person for the whole clip and running out is visible. The keeper is one
+    of the eleven rather than a slot of its own, because a broadcast frame
+    does not reach both goals -- on Tesr1, two keepers were never both visible
+    in any of 1471 frames.
+
+    Colour separates the two kits, not the eleven inside one, so two
+    team-mates can still exchange numbers unnoticed.
+    """
+
+    enabled: bool = False
+    slots_per_team: int = 11
+    max_gap_frames: int = 75          # a number is freed after this long unworn
+    distance_gate_px: float = 250.0   # how far a returning player may reappear
+    unnumbered_classes: Tuple[str, ...] = ("referee",)
+    # Every Nth frame is projected to metres. Roles are read off the shape of
+    # a whole track, so the grid only has to be fine enough that two tracks
+    # share frames to be compared on.
+    pitch_sample_every: int = 5
 
 
 @dataclass
@@ -145,8 +176,13 @@ class TrackingConfig:
     tracker_type: str = "botsort"     # "botsort" (preferred) | "bytetrack"
     separate_ball: bool = True        # track the ball with its own tracker
     ball_class_name: str = "ball"
-    with_reid: bool = False           # native ReID needs model.track(); off here
-    reid_model: str = "auto"          # path to a ReID checkpoint, or "auto"
+    with_reid: bool = False           # opt-in; config.yaml turns it on
+    reid_model: str = "auto"          # "auto" is unsupported standalone -- use a checkpoint
+    # Give the tracker the boxes that failed the per-class display thresholds.
+    # BoT-SORT's second association pass is over low-score boxes; without them
+    # a player whose score dips during an occlusion loses their track and comes
+    # back as a new id. Weak boxes are never exported or drawn.
+    feed_weak_detections: bool = True
     save_tracks: bool = True
     output_path: Optional[str] = None  # override for the tracking JSON path
     # Main tracker handles player / goalkeeper / referee.
@@ -172,6 +208,8 @@ class TrackingConfig:
     # Post-tracking appearance ID-swap correction (fix crossing swaps).
     swap_correction: SwapCorrectionConfig = field(
         default_factory=SwapCorrectionConfig)
+    # Fixed squad numbers over the corrected tracks.
+    roster: RosterConfig = field(default_factory=RosterConfig)
 
 
 @dataclass
@@ -399,13 +437,15 @@ def _build_section(cls, raw: dict):
 def _build_tracking(raw: dict) -> TrackingConfig:
     """Build a TrackingConfig, including its nested per-tracker params."""
     raw = dict(raw or {})
-    nested_keys = {"main", "ball", "ball_tracking", "stitching", "swap_correction"}
+    nested_keys = {"main", "ball", "ball_tracking", "stitching",
+                   "swap_correction", "roster"}
     scalar = {k: v for k, v in raw.items() if k not in nested_keys}
     tracking = _build_section(TrackingConfig, scalar)
     tracking.main = _build_section(BotSortParams, raw.get("main"))
     tracking.stitching = _build_section(StitchingConfig, raw.get("stitching"))
     tracking.swap_correction = _build_section(
         SwapCorrectionConfig, raw.get("swap_correction"))
+    tracking.roster = _build_section(RosterConfig, raw.get("roster"))
     # Ball params default to the looser preset; only override what's given.
     ball_defaults = TrackingConfig().ball
     ball_raw = raw.get("ball") or {}

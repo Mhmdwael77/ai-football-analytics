@@ -9,7 +9,7 @@ and the pipeline testable with a fake model.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -121,7 +121,46 @@ class YOLODetector:
         )
         return self._parse(results[0])
 
-    def _parse(self, result) -> List[Detection]:
+    def detect_with_weak(
+        self, frame: np.ndarray
+    ) -> Tuple[List[Detection], List[Detection]]:
+        """Detect once, return ``(confident, weak)`` from the same inference.
+
+        ``confident`` is exactly what :meth:`detect` returns -- the boxes that
+        clear the per-class display thresholds -- and is what gets exported and
+        drawn. ``weak`` holds the boxes that survived inference but *failed*
+        those thresholds.
+
+        The weak list exists for the tracker. BoT-SORT/ByteTrack associate in
+        two passes, and the second pass is over low-score boxes: that is the
+        mechanism that carries an id through a partial occlusion, when a
+        player's score dips under the display threshold for a few frames.
+        Feeding the tracker only the confident boxes leaves that pass with
+        nothing to match, so the track dies and the player returns as a NEW id.
+        Measured on this project's clips, dropouts like that -- not association
+        errors -- cause essentially every id switch.
+
+        Weak boxes never reach the JSON or the video; ``new_track_thresh``
+        keeps them from spawning tracks of their own.
+        """
+        results = self._model.predict(
+            source=frame,
+            conf=self._min_confidence,
+            iou=self._config.iou_threshold,
+            imgsz=self._config.image_size,
+            device=self._device,
+            verbose=False,
+        )
+        every = self._parse(results[0], apply_thresholds=False)
+        confident, weak = [], []
+        for det in every:
+            if self._passes_threshold(det.class_name, det.confidence):
+                confident.append(det)
+            else:
+                weak.append(det)
+        return confident, weak
+
+    def _parse(self, result, apply_thresholds: bool = True) -> List[Detection]:
         boxes = getattr(result, "boxes", None)
         if boxes is None or len(boxes) == 0:
             return []
@@ -133,7 +172,9 @@ class YOLODetector:
         detections: List[Detection] = []
         for box, confidence, class_id in zip(xyxy, confidences, class_ids):
             class_name = self._class_names.get(class_id, f"class_{class_id}")
-            if not self._passes_threshold(class_name, float(confidence)):
+            if apply_thresholds and not self._passes_threshold(
+                class_name, float(confidence)
+            ):
                 continue
             detections.append(
                 Detection(

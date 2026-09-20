@@ -165,6 +165,76 @@ def apply_swaps(
     return out
 
 
+def join_cost(
+    pos_a: Dict[int, Point], pos_b: Dict[int, Point], frame: int
+) -> Optional[float]:
+    """Pixels per frame implied by handing A's boxes to B from ``frame`` on.
+
+    Exchanging at ``frame`` joins A's last observation before it to B's first
+    observation from it onward, and vice versa; if either track is missing
+    boxes around there, the join spans that gap too. The cost is the worse of
+    the two sides, so a cheap join means both players stay where they were.
+    """
+    worst = 0.0
+    for src, dst in ((pos_a, pos_b), (pos_b, pos_a)):
+        before = [f for f in src if f < frame]
+        after = [f for f in dst if f >= frame]
+        if not before or not after:
+            return None
+        f0, f1 = max(before), min(after)
+        worst = max(worst, math.dist(src[f0], dst[f1]) / max(f1 - f0, 1))
+    return worst
+
+
+def _cheapest_frame(
+    pos_a: Dict[int, Point], pos_b: Dict[int, Point], frame: int, tol: int
+) -> int:
+    best, at = None, frame
+    for f in range(frame - tol, frame + tol + 1):
+        cost = join_cost(pos_a, pos_b, f)
+        if cost is not None and (best is None or cost < best):
+            best, at = cost, f
+    return at
+
+
+def refine_swap_edges(
+    swaps: Sequence[Swap],
+    positions: Dict[int, Dict[int, Point]],
+    tol: int = 45,
+) -> List[Swap]:
+    """Move each exchange to the frame where it costs the least motion.
+
+    Appearance says *that* two tracks were exchanged, but it cannot say
+    *when*: a jersey only reads as the other team once the two players have
+    drawn apart again, which is tens of frames after the boxes were actually
+    handed over. Exchanging at that boundary makes each repaired track
+    teleport across the gap they had opened -- on one clip this turned a 13
+    px/frame worst case into 376, i.e. the fix flung players across the pitch.
+
+    So the window is nudged to the cheapest join nearby, which is the crossing
+    itself. The pairing is unchanged; only its edges move.
+    """
+    out: List[Swap] = []
+    for a, b, start, end in swaps:
+        pos_a, pos_b = positions.get(a, {}), positions.get(b, {})
+        if not pos_a or not pos_b:
+            out.append((a, b, start, end))
+            continue
+        # Only an edge that sits inside both tracks is a crossing that can be
+        # moved. A window reaching the start or the end of the tracks means the
+        # exchange was already in force, or never undone, and has no edge there
+        # -- nudging such a boundary would carve a swap out of a correct
+        # stretch rather than align it to anything.
+        first = min(min(pos_a), min(pos_b))
+        last = max(max(pos_a), max(pos_b))
+        if start > first:
+            start = _cheapest_frame(pos_a, pos_b, start, tol)
+        if end < last:
+            end = max(_cheapest_frame(pos_a, pos_b, end + 1, tol) - 1, start)
+        out.append((a, b, start, end))
+    return out
+
+
 def unpaired_intervals(
     intervals: Sequence[SwapInterval],
     swaps: Sequence[Swap],
@@ -239,6 +309,7 @@ class SwapCorrector:
         split_unpaired: bool = True,
         min_split_samples: int = 3,
         min_split_purity: float = 0.7,
+        edge_refine_frames: int = 45,
     ) -> None:
         self.ball_class_name = ball_class_name
         self.samples_per_track = samples_per_track
@@ -249,6 +320,7 @@ class SwapCorrector:
         self.split_unpaired = split_unpaired
         self.min_split_samples = min_split_samples
         self.min_split_purity = min_split_purity
+        self.edge_refine_frames = edge_refine_frames
 
     def correct(self, frames: Sequence[FrameTracks], video_path) -> SwapResult:
         """Find swaps from jersey appearance and return corrected frames."""
@@ -330,6 +402,9 @@ class SwapCorrector:
         centers = _center_lookup(history)
         swaps = match_swaps(
             all_intervals, centers, self.frame_tol, self.distance_gate_px)
+        if swaps:
+            swaps = refine_swap_edges(
+                swaps, _position_lookup(history), self.edge_refine_frames)
         corrected = apply_swaps(frames, swaps) if swaps else list(frames)
 
         # Split the drift intervals that had no crossing partner: each becomes
@@ -355,6 +430,16 @@ class SwapCorrector:
             len(all_intervals), len(swaps), len(splits))
         return SwapResult(
             frames=corrected, swaps=swaps, n_swaps=len(swaps), splits=splits)
+
+
+def _position_lookup(history: Dict[int, List[Track]]) -> Dict[int, Dict[int, Point]]:
+    """``{track_id: {frame: center}}`` -- exact frames, unlike ``_center_lookup``.
+
+    Placing the exchange needs to know which frames a track actually has, so
+    that a join spanning a gap is charged for it.
+    """
+    return {tid: {o.frame_id: o.center for o in obs}
+            for tid, obs in history.items() if obs}
 
 
 def _center_lookup(history: Dict[int, List[Track]]):
